@@ -1,0 +1,468 @@
+// app.js
+// MiniTelegram All-in-One — iMessage-style UI
+// Node.js + Express + ws signalling + embedded frontend
+//
+// Run:
+// npm init -y
+// npm install express ws uuid
+// node app.js
+//
+// Open http://localhost:3000
+
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const { v4: uuidv4 } = require('uuid');
+
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
+const PORT = process.env.PORT || 3000;
+
+// In-memory store (demo)
+const STORE = {
+  users: {},      // phone -> { phone, name, socketId }
+  sockets: {},    // socketId -> ws
+  chats: {},      // chatId -> { id, isGroup, title, members:[], messages:[] }
+  userChats: {},  // phone -> Set(chatId)
+};
+
+function sendTo(ws, obj){ try{ ws.send(JSON.stringify(obj)); }catch(e){} }
+function makeChatId(a,b){ const arr=[a,b].sort(); return 'chat_' + arr.join('_'); }
+
+// WebSocket handling
+wss.on('connection', function connection(ws){
+  const sid = uuidv4();
+  STORE.sockets[sid] = ws;
+  ws._sid = sid;
+  console.log('WS connect', sid);
+
+  ws.on('message', (raw) => {
+    let data;
+    try { data = JSON.parse(raw); } catch(e){ return; }
+    const t = data.type;
+
+    if(t === 'register'){
+      const { phone, name } = data;
+      if(!phone) return;
+      STORE.users[phone] = STORE.users[phone] || { phone, name: name || `User${phone.slice(-4)}` };
+      STORE.users[phone].socketId = sid;
+      STORE.userChats[phone] = STORE.userChats[phone] || new Set();
+      sendTo(ws, { type:'registered', phone, name: STORE.users[phone].name });
+      // send chat list
+      const list = Array.from(STORE.userChats[phone] || []).map(id => STORE.chats[id]);
+      sendTo(ws, { type:'chats_list', chats: list });
+      return;
+    }
+
+    if(t === 'create_chat'){
+      const { from, to } = data;
+      if(!from || !to) return;
+      const id = makeChatId(from,to);
+      if(!STORE.chats[id]){
+        STORE.chats[id] = { id, isGroup:false, title:'', members:[from,to], messages:[] };
+        STORE.userChats[from] = STORE.userChats[from] || new Set(); STORE.userChats[from].add(id);
+        STORE.userChats[to] = STORE.userChats[to] || new Set(); STORE.userChats[to].add(id);
+      }
+      // notify both
+      [from,to].forEach(phone => {
+        const u = STORE.users[phone];
+        if(u && u.socketId && STORE.sockets[u.socketId]) sendTo(STORE.sockets[u.socketId], { type:'chats_list', chats:[STORE.chats[id]] });
+      });
+      return;
+    }
+
+    if(t === 'create_group'){
+      const { from, title, members } = data;
+      if(!from || !members || !Array.isArray(members)) return;
+      const id = 'group_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
+      const unique = Array.from(new Set([...members, from]));
+      STORE.chats[id] = { id, isGroup:true, title: title || 'Group', members: unique, messages: [] };
+      unique.forEach(phone => {
+        STORE.userChats[phone] = STORE.userChats[phone] || new Set(); STORE.userChats[phone].add(id);
+        const u = STORE.users[phone];
+        if(u && u.socketId && STORE.sockets[u.socketId]) sendTo(STORE.sockets[u.socketId], { type:'chats_list', chats:[STORE.chats[id]] });
+      });
+      return;
+    }
+
+    if(t === 'send_message'){
+      const { chatId, from, text } = data;
+      if(!chatId || !from) return;
+      const chat = STORE.chats[chatId];
+      if(!chat) return;
+      const msg = { id: 'm_' + Date.now(), from, text, time: Date.now() };
+      chat.messages.push(msg);
+      // notify members
+      chat.members.forEach(phone => {
+        const u = STORE.users[phone];
+        if(u && u.socketId && STORE.sockets[u.socketId]) sendTo(STORE.sockets[u.socketId], { type:'message', chatId, message: msg });
+      });
+      return;
+    }
+
+    if(t === 'signal'){
+      const { toPhone, fromPhone, signal } = data;
+      if(!toPhone || !fromPhone) return;
+      const toU = STORE.users[toPhone];
+      if(toU && toU.socketId && STORE.sockets[toU.socketId]){
+        sendTo(STORE.sockets[toU.socketId], { type:'signal', fromPhone, signal });
+      } else {
+        sendTo(ws, { type:'signal_error', toPhone });
+      }
+      return;
+    }
+
+    if(t === 'call'){
+      const { action, from, to, payload } = data;
+      const toU = STORE.users[to];
+      if(toU && toU.socketId && STORE.sockets[toU.socketId]) {
+        sendTo(STORE.sockets[toU.socketId], { type:'call', action, from, payload });
+      } else {
+        sendTo(ws, { type:'call_error', to });
+      }
+      return;
+    }
+
+    if(t === 'ping'){ sendTo(ws, { type:'pong' }); return; }
+  });
+
+  ws.on('close', () => {
+    // cleanup
+    delete STORE.sockets[sid];
+    for(const p in STORE.users){
+      if(STORE.users[p].socketId === sid) STORE.users[p].socketId = null;
+    }
+    console.log('WS closed', sid);
+  });
+});
+
+// Serve embedded frontend — iMessage-style modern UI
+app.get('/', (req,res) => {
+  res.send(`<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MiniTelegram — iMessage UI</title>
+<link rel="icon" href="data:;base64,iVBORw0KGgo=">
+<style>
+  :root{
+    --bg:#f2f5f8; --panel:#ffffff; --accent:#0a84ff; --muted:#6b7280; --text:#0b1320;
+    --bubble-me: linear-gradient(180deg,#0a84ff,#0066ff);
+    --bubble-other: #eef6ff;
+    --radius:18px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:var(--bg); color:var(--text); -webkit-font-smoothing:antialiased;}
+  header{height:64px;display:flex;align-items:center;padding:12px 18px;background:var(--panel);box-shadow:0 1px 0 rgba(12,14,20,0.04)}
+  header .brand{font-weight:700;color:var(--accent);font-size:18px}
+  .app{display:flex;height:calc(100vh - 64px);overflow:hidden}
+  .left{width:340px;background:var(--panel);border-right:1px solid rgba(11,18,32,0.04);display:flex;flex-direction:column}
+  .profile{display:flex;align-items:center;gap:12px;padding:14px}
+  .avatar{width:56px;height:56px;border-radius:14px;background:linear-gradient(135deg,#ff8a00,#ff2d55);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:20px}
+  .profile .meta{display:flex;flex-direction:column}
+  .profile .name{font-weight:700}
+  .search{padding:0 14px}
+  .search input{width:100%;padding:10px;border-radius:12px;border:1px solid rgba(11,18,32,0.06)}
+  .controls{display:flex;gap:8px;padding:12px}
+  .controls button{flex:1;padding:10px;border-radius:10px;border:1px solid rgba(11,18,32,0.06);background:#fff;cursor:pointer}
+  .chats{flex:1;overflow:auto;padding:8px}
+  .chat-item{display:flex;gap:12px;padding:10px;border-radius:12px;align-items:center;cursor:pointer}
+  .chat-item:hover{background:#fbfdff}
+  .chat-item .mini{width:48px;height:48px;border-radius:12px;background:#c7d2fe;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700}
+  .chat-item .info{flex:1}
+  .chat-item .title{font-weight:700}
+  .chat-item .last{font-size:13px;color:var(--muted);margin-top:4px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+
+  .right{flex:1;display:flex;flex-direction:column}
+  .chat-header{height:72px;display:flex;align-items:center;padding:12px 18px;border-bottom:1px solid rgba(11,18,32,0.04);background:linear-gradient(180deg,#fff,#fbfdff)}
+  .chat-header .who{font-weight:700}
+  .messages{flex:1;padding:18px;overflow:auto;background:linear-gradient(180deg,#fff,#f7fbff)}
+  .bubble{display:inline-block;padding:12px 14px;border-radius:16px;max-width:68%;margin:8px 0;line-height:1.25}
+  .bubble.me{background:var(--bubble-me);color:#fff;border-bottom-right-radius:6px;margin-left:auto;box-shadow:0 6px 18px rgba(10,132,255,0.16)}
+  .bubble.other{background:var(--bubble-other);color:var(--text);border-bottom-left-radius:6px}
+  .time{font-size:11px;color:var(--muted);margin-top:6px}
+  .composer{display:flex;gap:8px;padding:12px;border-top:1px solid rgba(11,18,32,0.04);background:var(--panel)}
+  .composer input{flex:1;padding:12px;border-radius:12px;border:1px solid rgba(11,18,32,0.06)}
+  .composer button{padding:10px 14px;border-radius:10px;border:none;background:var(--accent);color:#fff;cursor:pointer}
+
+  .small{font-size:13px;color:var(--muted)}
+  .hidden{display:none}
+
+  /* responsive */
+  @media (max-width:900px){
+    .left{width:100%;position:fixed;z-index:40;height:calc(100vh - 64px);transform:translateX(0)}
+    .right{margin-top:64px}
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/simple-peer@9/simplepeer.min.js"></script>
+</head>
+<body>
+  <header><div class="brand">MiniTelegram</div></header>
+  <div class="app">
+    <div class="left" id="leftPane">
+      <div id="authPanel">
+        <div style="padding:14px">
+          <div class="small">Вход / регистрация</div>
+          <input id="phone" placeholder="+71234567890" style="width:100%;padding:10px;border-radius:10px;border:1px solid #e6eef8;margin-top:8px" />
+          <div style="display:flex;gap:8px;margin-top:8px">
+            <button id="sendCodeBtn">Получить код</button>
+            <button id="demoBtn">Demo</button>
+          </div>
+          <div id="codeWrap" class="hidden" style="margin-top:8px">
+            <input id="code" placeholder="Код (любой)" style="width:100%;padding:10px;border-radius:10px;border:1px solid #e6eef8" />
+            <button id="confirmBtn" style="margin-top:8px;width:100%">Подтвердить</button>
+          </div>
+          <div class="small" style="margin-top:8px">Данные в демо хранятся в памяти сервера. Для публичного использования разверните на VPS.</div>
+        </div>
+      </div>
+
+      <div id="uiPanel" class="hidden">
+        <div class="profile">
+          <div class="avatar" id="myAvatar">U</div>
+          <div class="meta">
+            <div class="name" id="myName">User</div>
+            <div class="small" id="myPhone">+70000000000</div>
+          </div>
+        </div>
+        <div class="search"><input id="search" placeholder="Поиск чатов или контактов" /></div>
+        <div class="controls" style="padding:12px">
+          <button id="newChatBtn">Новый чат</button>
+          <button id="newGroupBtn">Новая группа</button>
+        </div>
+        <div class="chats" id="chatsList"></div>
+      </div>
+    </div>
+
+    <div class="right">
+      <div class="chat-header">
+        <div class="who" id="chatTitle">Выберите чат</div>
+      </div>
+      <div class="messages" id="messages"><div class="small">Откройте чат справа</div></div>
+      <div class="composer hidden" id="composer">
+        <input id="messageInput" placeholder="Напишите сообщение..." />
+        <button id="sendBtn">Отправить</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  const wsProto = (location.protocol === 'https:') ? 'wss://' : 'ws://';
+  const wsUrl = wsProto + location.host;
+  const socket = new WebSocket(wsUrl);
+
+  // client store
+  const CLIENT = { me: null, chats: {} };
+  let currentChat = null;
+  let peers = {}; // phone -> { peer, stream }
+
+  // DOM
+  const $ = id => document.getElementById(id);
+  const $chats = $('chatsList'), $messages = $('messages'), $composer = $('composer');
+
+  function send(obj){ if(socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(obj)); }
+
+  socket.onopen = ()=> console.log('WS open', wsUrl);
+  socket.onmessage = (ev) => {
+    let data;
+    try{ data = JSON.parse(ev.data); }catch(e){ return; }
+    // console.log('recv', data);
+    if(data.type === 'registered'){
+      CLIENT.me = { phone: data.phone, name: data.name };
+      onLoggedIn();
+    }
+    if(data.type === 'chats_list'){
+      (data.chats || []).forEach(c => { CLIENT.chats[c.id] = c; });
+      renderChats();
+    }
+    if(data.type === 'message'){
+      const { chatId, message } = data;
+      if(!CLIENT.chats[chatId]) CLIENT.chats[chatId] = { id:chatId, members:[], messages:[], isGroup:false, title:'' };
+      CLIENT.chats[chatId].messages = CLIENT.chats[chatId].messages || [];
+      CLIENT.chats[chatId].messages.push(message);
+      if(currentChat === chatId) renderMessages(chatId);
+      renderChats();
+    }
+    if(data.type === 'signal'){
+      // signal from other user
+      const from = data.fromPhone;
+      const sig = data.signal;
+      handleSignal(from, sig);
+    }
+    if(data.type === 'call'){
+      // optional call messages
+      console.log('call event', data);
+    }
+  };
+
+  // UI actions
+  $('sendCodeBtn').onclick = ()=> {
+    const p = $('phone').value.trim();
+    if(!p){ alert('Введите номер телефона'); return; }
+    $('codeWrap').classList.remove('hidden');
+    alert('Код отправлен (в демо любой код подойдёт)');
+  };
+  $('confirmBtn').onclick = ()=> {
+    const p = $('phone').value.trim();
+    if(!p){ alert('Введите номер'); return; }
+    send({ type:'register', phone: p, name: 'User' + p.slice(-4) });
+  };
+  $('demoBtn').onclick = ()=> {
+    const p = '+7999' + Math.floor(Math.random()*900000).toString().padStart(6,'0');
+    $('phone').value = p;
+    send({ type:'register', phone: p, name: 'Demo' });
+  };
+
+  function onLoggedIn(){
+    $('authPanel').classList.add('hidden');
+    $('uiPanel').classList.remove('hidden');
+    $('myAvatar').textContent = CLIENT.me.name ? CLIENT.me.name[0] : CLIENT.me.phone[0];
+    $('myName').textContent = CLIENT.me.name || CLIENT.me.phone;
+    $('myPhone').textContent = CLIENT.me.phone;
+  }
+
+  $('newChatBtn').onclick = ()=> {
+    const to = prompt('Введите номер контакта для чата (пример +71234567890)');
+    if(!to) return;
+    send({ type:'create_chat', from: CLIENT.me.phone, to });
+  };
+  $('newGroupBtn').onclick = ()=> {
+    const title = prompt('Название группы');
+    const membersRaw = prompt('Список номеров через запятую (включая ваш номер)');
+    if(!title || !membersRaw) return;
+    const members = membersRaw.split(',').map(s=>s.trim()).filter(Boolean);
+    send({ type:'create_group', from: CLIENT.me.phone, title, members });
+  };
+
+  function renderChats(){
+    $chats.innerHTML = '';
+    Object.values(CLIENT.chats).forEach(c => {
+      const item = document.createElement('div'); item.className='chat-item';
+      const title = c.isGroup ? (c.title || 'Группа') : (c.members.find(m=>m !== (CLIENT.me && CLIENT.me.phone)) || 'Чат');
+      const mini = document.createElement('div'); mini.className='mini'; mini.textContent = title[0] || '?';
+      const info = document.createElement('div'); info.className='info';
+      const t = document.createElement('div'); t.className='title'; t.textContent = title;
+      const last = (c.messages && c.messages.length) ? c.messages[c.messages.length-1].text : '';
+      const sub = document.createElement('div'); sub.className='last'; sub.textContent = last;
+      info.appendChild(t); info.appendChild(sub);
+      item.appendChild(mini); item.appendChild(info);
+      item.onclick = ()=> openChat(c.id);
+      $chats.appendChild(item);
+    });
+  }
+
+  function renderMessages(chatId){
+    const c = CLIENT.chats[chatId];
+    if(!c){ $messages.innerHTML = '<div class="small">Чат не найден</div>'; return; }
+    currentChat = chatId;
+    $('chatTitle').textContent = c.isGroup ? (c.title || 'Группа') : (c.members.find(m=>m !== CLIENT.me.phone) || 'Чат');
+    $messages.innerHTML = '';
+    (c.messages || []).forEach(m => {
+      const b = document.createElement('div');
+      b.className = 'bubble ' + (m.from === CLIENT.me.phone ? 'me' : 'other');
+      b.innerHTML = `<div>${escapeHtml(m.text)}</div><div class="time">${new Date(m.time).toLocaleTimeString()}</div>`;
+      $messages.appendChild(b);
+    });
+    $messages.scrollTop = $messages.scrollHeight;
+    $composer.classList.remove('hidden');
+  }
+
+  function openChat(id){
+    if(!CLIENT.chats[id]) {
+      // request server to ensure chat exists (server will push it back)
+      // nothing to do here — but we set currentChat to id to allow messages
+      CLIENT.chats[id] = { id, members:[], messages:[], isGroup:false, title:'' };
+    }
+    renderMessages(id);
+  }
+
+  function sendMessage(){
+    const text = $('messageInput').value.trim();
+    if(!text || !currentChat) return;
+    const payload = { type:'send_message', chatId: currentChat, from: CLIENT.me.phone, text };
+    send(payload);
+    // optimistic render
+    const msg = { id: 'm_' + Date.now(), from: CLIENT.me.phone, text, time: Date.now() };
+    CLIENT.chats[currentChat].messages = CLIENT.chats[currentChat].messages || [];
+    CLIENT.chats[currentChat].messages.push(msg);
+    renderMessages(currentChat);
+    $('messageInput').value = '';
+  }
+  $('sendBtn').onclick = sendMessage;
+  $('messageInput').addEventListener('keydown', (e) => { if(e.key === 'Enter') sendMessage(); });
+
+  // WebRTC (Simple-Peer) calling basics
+  // For demo: basic peer-to-peer signaling via server (no TURN)
+  function startCall(isVideo){
+    if(!currentChat) return alert('Откройте чат, затем нажмите Call в заголовке (ещё не реализовано на UI)');
+    const chat = CLIENT.chats[currentChat];
+    if(!chat || chat.isGroup) return alert('Демо поддерживает 1:1 звонки только');
+    const other = chat.members.find(m => m !== CLIENT.me.phone);
+    if(!other) return alert('Нет собеседника');
+
+    navigator.mediaDevices.getUserMedia({ audio:true, video:!!isVideo }).then(stream => {
+      // create peer as initiator
+      const peer = new SimplePeer({ initiator: true, trickle: false, stream });
+      peers[other] = peers[other] || {};
+      peers[other].peer = peer;
+      peers[other].stream = stream;
+      peer.on('signal', data => {
+        send({ type:'signal', toPhone: other, fromPhone: CLIENT.me.phone, signal: data });
+      });
+      peer.on('stream', remoteStream => {
+        playRemote(remoteStream);
+      });
+      peer.on('connect', ()=> console.log('P2P connected'));
+    }).catch(err => alert('Ошибка доступа к микрофону/камере: ' + err.message));
+  }
+
+  // handle signal from remote
+  function handleSignal(fromPhone, signal){
+    if(peers[fromPhone] && peers[fromPhone].peer){
+      peers[fromPhone].peer.signal(signal);
+      return;
+    }
+    // create a non-initiator peer (answer)
+    navigator.mediaDevices.getUserMedia({ audio:true, video:false }).then(stream => {
+      const peer = new SimplePeer({ initiator: false, trickle: false, stream });
+      peers[fromPhone] = peers[fromPhone] || {};
+      peers[fromPhone].peer = peer;
+      peers[fromPhone].stream = stream;
+      peer.on('signal', data => {
+        send({ type:'signal', toPhone: fromPhone, fromPhone: CLIENT.me.phone, signal: data });
+      });
+      peer.on('stream', remoteStream => { playRemote(remoteStream); });
+      peer.on('connect', ()=> console.log('P2P connected answer'));
+      peer.signal(signal);
+    }).catch(err => console.warn('No mic access for auto-answer', err));
+  }
+
+  function playRemote(stream){
+    // create floating small video
+    let v = document.getElementById('remoteVideoFloat');
+    if(!v){
+      v = document.createElement('video'); v.id = 'remoteVideoFloat';
+      v.autoplay = true; v.playsInline = true;
+      v.style.position = 'fixed'; v.style.right = '14px'; v.style.bottom = '14px';
+      v.style.width = '220px'; v.style.height = '140px'; v.style.borderRadius = '12px'; v.style.boxShadow = '0 10px 30px rgba(0,0,0,0.15)';
+      document.body.appendChild(v);
+    }
+    v.srcObject = stream;
+  }
+
+  // utility
+  function escapeHtml(s){ return String(s).replace(/[&<>"']/g, function(m){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]; }); }
+
+})();
+</script>
+</body>
+</html>`);
+});
+
+// start server
+server.listen(PORT, () => {
+  console.log('MiniTelegram (iMessage UI) running at http://localhost:' + PORT);
+  console.log('WebSocket signalling active on same origin.');
+});
